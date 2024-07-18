@@ -1,0 +1,118 @@
+import com.itextpdf.text.Document;
+import com.itextpdf.text.DocumentException;
+import com.itextpdf.text.pdf.*;
+import java.io.*;
+import java.util.HashMap;
+import java.util.Map;
+/**
+ * @author:
+ * @Create: 2023/8/3-21:25
+ */
+public class Test1 {
+ 
+    /**
+     * 模板路径
+     */
+    private static final String IN_PUT_PATH = "c:/test/1.pdf";
+    /**
+     * 生成的新文件路径
+     */
+    private static final String OUT_PUT_PATH = "c:/test/2.pdf";
+    /**
+     * 字体路径
+     */
+    private static final String TYPEFACE_PATH = "c:/test/微软雅黑.ttf";
+ 
+    public static void main(String[] args) throws DocumentException {
+        Map<String, String> map = new HashMap<>();
+        map.put("jiaFangDa", "张三");
+        map.put("heTongBianHao", "合同编号10086");
+        map.put("nian", "2023");
+        map.put("yue", "8");
+        map.put("ri", "4");
+        map.put("jiaFang", "张三小号");
+        map.put("lianXiRen", "宵夜");
+        map.put("lianXiDianHua", "15919998889");
+        map.put("danJia", "100771");
+        map.put("danWei", "账号/个/季度");
+        map.put("shuLiang", "100");
+        map.put("heJi", "20000000");
+        map.put("shiJian", "3个月");
+        map.put("kaiShiNian", "2022");
+        map.put("kaiShiYue", "10");
+        map.put("kaiShiRi", "1");
+        map.put("jieShuNian", "2023");
+        map.put("jieShuYue", "10");
+        map.put("jieShuRi", "2");
+        map.put("ge", "100");
+        map.put("jinE", "1000000");
+        map.put("jinED", "一百万");
+        map.put("danWeiMing", "单位名称");
+        map.put("naShui", "纳税编码号");
+        map.put("zhuCeDiZhi", "注册地址南山");
+        map.put("dianHua", "19823798123");
+        map.put("kaiHu", "招商银行");
+        map.put("yinHangZhangHao", "12398809i30918209");
+        map.put("qianNian", "2023");
+        map.put("qianYue", "8");
+        map.put("qianRi", "6");
+        map.put("z1", "账号1");
+        map.put("n1", "昵称1");
+        map.put("z2", "账号2");
+        map.put("n2", "昵称2");
+ 
+        pdfout1(map,IN_PUT_PATH,OUT_PUT_PATH,TYPEFACE_PATH);
+    }
+ 
+ 
+ 
+ 
+ 
+ 
+    public static void pdfout1(Map<String, String> map,String inPutPath,String outPutPath,String typefacePath) throws DocumentException {
+        PdfStamper stamper;
+        PdfReader reader = null;
+        Document doc = null;
+        try (
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                FileOutputStream out = new FileOutputStream(outPutPath);
+        ){
+            // 设置字体
+            BaseFont bf = BaseFont.createFont(typefacePath, BaseFont.IDENTITY_H, BaseFont.EMBEDDED);
+            reader = new PdfReader(inPutPath);// 读取pdf模板
+            stamper = new PdfStamper(reader, bos);
+            AcroFields form = stamper.getAcroFields();
+            //文字类的内容处理
+            form.addSubstitutionFont(bf);
+            for (String key : map.keySet()) {
+                String value = map.get(key);
+                form.setField(key, value);
+            }
+            stamper.setFormFlattening(true);// 如果为false，生成的PDF文件可以编辑，如果为true，生成的PDF文件不可以编辑
+            //要先关闭他不然会出错
+            stamper.close();
+            doc = new Document();
+            PdfCopy copy = new PdfCopy(doc, out);
+            doc.open();
+ 
+            int numberOfPages = reader.getNumberOfPages();
+            System.out.println(numberOfPages);
+ 
+            for (int i = 1; i <=numberOfPages ; i++) {
+                PdfImportedPage importPage = copy.getImportedPage(new PdfReader(bos.toByteArray()), i);
+                copy.addPage(importPage);
+            }
+            doc.close();
+        } catch (IOException | DocumentException e) {
+            System.out.println(e);
+        }finally {
+            try {
+                reader.close();
+                doc.close();
+            }catch (Exception e){
+                System.out.println("流关闭异常" + e.getMessage());
+            }
+        }
+    }
+ 
+}
