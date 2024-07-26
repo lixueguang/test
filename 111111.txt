@@ -1,0 +1,61 @@
+<dependency>
+    <groupId>org.mybatis.generator</groupId>
+    <artifactId>mybatis-generator-core</artifactId>
+    <version>1.3.7</version>
+    <scope>provided</scope>
+</dependency>
+
+<plugin>
+    <groupId>org.mybatis.generator</groupId>
+    <artifactId>mybatis-generator-maven-plugin</artifactId>
+    <version>1.3.7</version>
+
+    <configuration>
+        <configurationFile>src/main/resources/mybatis-generator.xml</configurationFile>
+        <overwrite>true</overwrite>
+    </configuration>
+
+    <dependencies>
+        <dependency>
+            <groupId>mysql</groupId>
+            <artifactId>mysql-connector-java</artifactId>
+            <version>8.0.12</version>
+        </dependency>
+    </dependencies>
+</plugin>
+
+
+
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE generatorConfiguration
+        PUBLIC "-//mybatis.org//DTD MyBatis Generator Configuration 1.0//EN"
+        "http://mybatis.org/dtd/mybatis-generator-config_1_0.dtd">
+
+<generatorConfiguration>
+
+    <context id="MySql" defaultModelType="flat">     
+
+        <plugin type="org.mybatis.generator.plugins.SerializablePlugin" />
+
+        <jdbcConnection
+                driverClass="com.mysql.jdbc.Driver"
+                connectionURL="jdbc:mysql://121.196.123.245:3306/demo"
+                userId="root"
+                password="xxxxxx" />
+
+        <javaModelGenerator targetPackage="cn.codesheep.springbt_mybatis_generator.entity" targetProject="src/main/java"></javaModelGenerator>
+
+        <sqlMapGenerator targetPackage="mapper"  targetProject="src/main/resources"></sqlMapGenerator>
+
+        <javaClientGenerator targetPackage="cn.codesheep.springbt_mybatis_generator.mapper" targetProject="src/main/java" type="XMLMAPPER"></javaClientGenerator>
+
+        <table tableName="user_info">
+            <property name="modelOnly" value="false"/>
+        </table>
+
+    </context>
+
+</generatorConfiguration>
