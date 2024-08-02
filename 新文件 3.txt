@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Upload Form",
+  "type": "object",
+  "properties": {
+    "file": {
+      "type": "string",
+      "format": "binary",
+      "description": "The file to be uploaded"
+    },
+    "metadata": {
+      "$ref": "#/definitions/metadata"
+    },
+    "additionalData": {
+      "$ref": "#/definitions/additionalData"
+    }
+  },
+  "required": ["file", "metadata", "additionalData"],
+  "definitions": {
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The name of the person"
+        },
+        "age": {
+          "type": "integer",
+          "description": "The age of the person",
+          "minimum": 0
+        }
+      },
+      "required": ["name", "age"]
+    },
+    "additionalData": {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string",
+          "description": "The address of the person"
+        },
+        "phoneNumber": {
+          "type": "string",
+          "description": "The phone number of the person"
+        }
+      },
+      "required": ["address", "phoneNumber"]
+    }
+  }
+}
