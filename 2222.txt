@@ -1,0 +1,80 @@
+public class ApiResponse<T> {
+
+    private StatusInfo statusInfo;
+    private T data;
+
+    // Getters 和 Setters
+
+    public StatusInfo getStatusInfo() {
+        return statusInfo;
+    }
+
+    public void setStatusInfo(StatusInfo statusInfo) {
+        this.statusInfo = statusInfo;
+    }
+
+    public T getData() {
+        return data;
+    }
+
+    public void setData(T data) {
+        this.data = data;
+    }
+
+    // 内部类用于定义状态信息
+    public static class StatusInfo {
+        private String code;
+        private String message;
+        private List<String> causes;
+
+        // Getters 和 Setters
+
+        public String getCode() {
+            return code;
+        }
+
+        public void setCode(String code) {
+            this.code = code;
+        }
+
+        public String getMessage() {
+            return message;
+        }
+
+        public void setMessage(String message) {
+            this.message = message;
+        }
+
+        public List<String> getCauses() {
+            return causes;
+        }
+
+        public void setCauses(List<String> causes) {
+            this.causes = causes;
+        }
+    }
+}
+
+
+public class Application {
+    private String id;
+    private String applicationId;
+
+    // Getters 和 Setters
+
+    public String getId() {
+        return id;
+    }
+
+    public void setId(String id) {
+        this.id = id;
+    }
+
+    public String getApplicationId() {
+        return applicationId;
+    }
+
+    public void setApplicationId(String applicationId) {
+        this.applicationId = applicationId;
+    }
+}
