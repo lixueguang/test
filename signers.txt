@@ -1,0 +1,71 @@
+class MoreSigner {
+    private String name;
+    private String idType;
+    private String id;
+
+    // Constructors, getters, setters, toString() method
+    public MoreSigner(String name, String idType, String id) {
+        this.name = name;
+        this.idType = idType;
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public String getIdType() {
+        return idType;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    @Override
+    public String toString() {
+        return "MoreSigner{" +
+               "name='" + name + '\'' +
+               ", idType='" + idType + '\'' +
+               ", id='" + id + '\'' +
+               '}';
+    }
+}，
+
+
+public static void main(String[] args) {
+        List<MoreSigner> moreSigners = Arrays.asList(
+                new MoreSigner("David", "HKID", "123456(7)"),
+                new MoreSigner("David", "HKID", "123457(7)"),
+                new MoreSigner("Alice", null, null),
+                new MoreSigner("ALICE", null, null),
+                new MoreSigner("Bob", "Passport", "98765")
+        );
+
+        // 使用两个 Map 进行去重：
+        // 1. 对于 name 和 idType 都不为空的情况，使用 (name + idType) 去重。
+        Map<String, MoreSigner> uniqueByIdType = moreSigners.stream()
+            .filter(signer -> signer.getIdType() != null && signer.getId() != null)
+            .collect(Collectors.toMap(
+                signer -> signer.getName() + "," + signer.getIdType(),
+                signer -> signer,
+                (existing, replacement) -> replacement // 保留较新的 id
+            ));
+
+        // 2. 对于只有 name 的情况，使用 name 的大写形式去重。
+        Map<String, MoreSigner> uniqueByName = moreSigners.stream()
+            .filter(signer -> signer.getIdType() == null && signer.getId() == null)
+            .collect(Collectors.toMap(
+                signer -> signer.getName().toUpperCase(),
+                signer -> signer,
+                (existing, replacement) -> existing // 保留原始对象
+            ));
+
+        // 合并两种情况的去重结果
+        List<MoreSigner> deduplicatedList = new ArrayList<>();
+        deduplicatedList.addAll(uniqueByIdType.values());
+        deduplicatedList.addAll(uniqueByName.values());
+
+        // 输出去重后的列表
+        deduplicatedList.forEach(System.out::println);
+    }
