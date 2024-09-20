@@ -1,0 +1,15 @@
+Oracle 一张表 有appliactionId， appliactionId 可以有多个不同的value, 通过appliactionId查的时候，需要查出 response这个字段， response这个字段是clob类型， 因为对应的response字段是多个,需要将response字段拼接起来。 请写出举例 并写出sql.
+response字段的 value 类似于 
+{
+"newStatus"："01"
+"cause": "no need to send"
+}
+需要取cause字段 拼接
+
+
+
+CREATE OR REPLACE VIEW view_combined_causes AS
+SELECT applicationId, 
+       LISTAGG(JSON_VALUE(response, '$.cause'), ', ') WITHIN GROUP (ORDER BY applicationId) AS combined_causes
+FROM applications
+GROUP BY applicationId;
