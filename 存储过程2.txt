@@ -1,0 +1,70 @@
+Oracle 一张表 有varchar类型的appliactionId，TimeStamp类型的lastModifyTime, appliactionId 可以有多个不同的value, 通过appliactionId查的时候，需要查出 response这个字段（response如果为空显示为NA）， response这个字段是clob类型， 因为对应的response字段是多个,需要取lastModifyTime最新的一个 。 请写出举例 并写出sql.
+response字段的 value 类似于 
+{
+"newStatus"："01"
+"cause": "no need to send"
+}  举例并初始化数据 和 拿到的结果   ,性能高的sql ,使用 group by
+
+CREATE OR REPLACE VIEW view_combined_causes AS
+SELECT applicationId, 
+       LISTAGG(JSON_VALUE(response, '$.cause'), ', ') WITHIN GROUP (ORDER BY applicationId) AS combined_causes
+FROM applications
+GROUP BY applicationId;
+
+
+
+SELECT t.applicationId, 
+       COALESCE(t.response, 'NA') AS response, 
+       t.lastModifyTime
+FROM your_table_name t
+JOIN (
+    SELECT applicationId, MAX(lastModifyTime) AS maxTime
+    FROM your_table_name
+    GROUP BY applicationId
+) m 
+ON t.applicationId = m.applicationId AND t.lastModifyTime = m.maxTime;
+
+CREATE INDEX idx_application_last_modify ON your_table_name(applicationId, lastModifyTime DESC);
+
+
+
+
+
+SELECT applicationId, response, lastModifyTime
+FROM (
+    SELECT applicationId, response, lastModifyTime,
+           ROW_NUMBER() OVER (PARTITION BY applicationId ORDER BY lastModifyTime DESC) AS rn
+    FROM your_table_name
+    WHERE applicationId = :applicationId
+) 
+WHERE rn = 1;
+
+
+
+将方法改为 public 或 protected：
+
+如果希望事务逻辑生效，将 private 方法修改为 public 或 protected。
+java
+复制代码
+@Transactional
+public void publicMethod() {
+    // 事务逻辑
+    protectedMethod(); // 调用被保护的公共方法
+}
+
+protected void protectedMethod() {
+    // 业务逻辑
+}
+
+
+SELECT t.applicationId, 
+       COALESCE(JSON_VALUE(t.response, '$.cause'), 'NA') AS cause, 
+       t.lastModifyTime
+FROM your_table_name t
+JOIN (
+    SELECT applicationId, MAX(lastModifyTime) AS maxTime
+    FROM your_table_name
+    GROUP BY applicationId
+) m 
+ON t.applicationId = m.applicationId 
+AND t.lastModifyTime = m.maxTime;
