@@ -1,0 +1,598 @@
+下面给你一份 完整可部署的方案（中文） —— 包含：
+
+模型驱动按钮的 Ribbon JS（Web Resource）；
+
+template 表（new_exporttemplate）建议字段；
+
+一整套 C# 插件代码（可直接放到 Visual Studio Class Library，引用 Microsoft.CrmSdk.CoreAssemblies），插件注册在 new_exporttemplate 的 Create/Update（status->Ready）上，Asynchronous 执行；
+
+注册/部署步骤与注意事项。
+
+我把重点放在「通用性」「递归 lookup」「1:N 子表」「避免循环」「CSV 可读性」以及「生产注意点」。代码里都写有中文注释，拿去改字段名就能直接编译注册。
+
+一、整体流程回顾（一句话）
+
+用户在模型驱动表单点 Export to CSV → JS 写入 new_exporttemplate（target entity + id + depth + includeLookups）→ 异步 C# 插件监听 template 的 Create / status = Ready → 读取目标记录与 metadata，递归导出主表 / 子表 / lookup 指向实体为若干 section，生成 CSV 写入 Annotation（Note），并在 template 上记录结果。
+
+二、template（任务表）建议字段（需要你在 Dataverse 中创建）
+
+表 logical name：new_exporttemplate（可按需改名，但代码要对应）
+
+字段（schema name）：
+
+new_exporttemplateid（主键 GUID，自动）
+
+new_targetentitylogicalname（单行文本，保存目标实体 logical name）
+
+new_targetid（GUID 或 Lookup，保存目标记录 id）
+
+new_status（OptionSet / TwoOptions，Ready/Processing/Done/Failed）
+
+new_depth（Whole Number，默认 1，递归深度）
+
+new_include_lookups（TwoOptions/Boolean，是否导出 lookup 对象为独立 section）
+
+new_result_note（Multiple Lines Text，写导出结果/错误信息）
+
+三、模型驱动按钮（Ribbon）JS（Web Resource）
+
+把下面代码保存为 createExportRequest.js，上传为 Web Resource，按钮命令调用 createExportRequest(executionContext)（示例使用 Xrm.WebApi.create）：
+// createExportRequest.js
+// 在模型驱动 Form 上调用：createExportRequest(executionContext)
+// 依赖：Xrm 全局对象
+
+async function createExportRequest(executionContext) {
+    try {
+        var formContext = executionContext.getFormContext();
+        var id = formContext.data.entity.getId(); // 带 {} 的 GUID
+        if (!id) {
+            Xrm.Navigation.openAlertDialog({ text: "未获取到当前记录 ID" });
+            return;
+        }
+        // 去掉大括号
+        id = id.replace("{", "").replace("}", "");
+        var entityName = formContext.data.entity.getEntityName();
+
+        // 读取 depth / includeLookups 可从表单字段或固定值
+        var depth = 2;
+        var includeLookups = true;
+
+        var body = {
+            "new_targetentitylogicalname": entityName,
+            "new_targetid": id,
+            "new_status": 100000000, // 例如自定义状态 Ready
+            "new_depth": depth,
+            "new_include_lookups": includeLookups
+        };
+
+        await Xrm.WebApi.createRecord("new_exporttemplate", body);
+        Xrm.Navigation.openAlertDialog({ text: "导出请求已创建，系统将异步生成 CSV。" });
+    } catch (err) {
+        Xrm.Navigation.openAlertDialog({ text: "创建导出请求失败：" + err.message });
+    }
+}
+注意：如果 new_targetid 是 Lookup 字段请改为 new_targetid@odata.bind 绑定语法或直接写 GUID 到文本字段；上面示例把 GUID 作为普通 guid 字段写入（需要你在 template 表中把 new_targetid 定义为类型 Guid 或单行文本）。
+
+
+四、完整 C# 插件代码（RecursiveCsvExportPlugin.cs）
+
+将下面代码放入 Visual Studio Class Library（.NET Framework 与 Dataverse SDK 版本相配），引用 NuGet 包 Microsoft.CrmSdk.CoreAssemblies。代码已尽量写明需替换的常量及注意点。
+
+using System;
+using System.Text;
+using System.Linq;
+using System.Collections.Generic;
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Query;
+using Microsoft.Xrm.Sdk.Messages;
+using Microsoft.Xrm.Sdk.Metadata;
+
+namespace DataversePlugins
+{
+    /// <summary>
+    /// 通用递归 CSV 导出插件
+    /// 注册点：new_exporttemplate(Create 或 Update status->Ready)，异步 PostOperation
+    /// 依赖 NuGet: Microsoft.CrmSdk.CoreAssemblies
+    /// </summary>
+    public class RecursiveCsvExportPlugin : IPlugin
+    {
+        // ----------------- 请根据你实际 template 表字段替换下面常量 -----------------
+        private const string TemplateEntityLogicalName = "new_exporttemplate";
+        private const string Template_TargetEntityField = "new_targetentitylogicalname"; // string
+        private const string Template_TargetIdField = "new_targetid"; // guid 或 lookup
+        private const string Template_DepthField = "new_depth"; // int
+        private const string Template_IncludeLookupsField = "new_include_lookups"; // bool
+        private const string Template_ResultField = "new_result_note"; // multi-line text
+        // ------------------------------------------------------------------------------
+
+        // 注释附件大小阈值（示例），若超出建议上传到 Blob/SharePoint
+        private const int AnnotationMaxBytes = 5 * 1024 * 1024; // 5 MB
+
+        public void Execute(IServiceProvider serviceProvider)
+        {
+            var context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));
+            var factory = (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));
+            var service = factory.CreateOrganizationService(context.UserId);
+            var tracing = (ITracingService)serviceProvider.GetService(typeof(ITracingService));
+
+            try
+            {
+                if (!context.InputParameters.Contains("Target") || !(context.InputParameters["Target"] is Entity))
+                    return;
+
+                var template = (Entity)context.InputParameters["Target"];
+
+                // 读取 template 字段（防止在 Update 中部分字段不存在）
+                string targetEntityLogicalName = GetString(template, Template_TargetEntityField);
+                Guid targetId = GetGuid(template, Template_TargetIdField);
+                int depth = GetInt(template, Template_DepthField, 1);
+                bool includeLookups = GetBool(template, Template_IncludeLookupsField, true);
+
+                // 如果 targetId 为空，尝试在 template 的 lookup 字段中找到
+                if (targetId == Guid.Empty)
+                {
+                    foreach (var kv in template.Attributes)
+                    {
+                        if (kv.Value is EntityReference er && (kv.Key.IndexOf("target", StringComparison.OrdinalIgnoreCase) >= 0 || kv.Key.IndexOf("record", StringComparison.OrdinalIgnoreCase) >= 0))
+                        {
+                            targetId = er.Id;
+                            if (string.IsNullOrEmpty(targetEntityLogicalName)) targetEntityLogicalName = er.LogicalName;
+                            break;
+                        }
+                    }
+                }
+
+                if (string.IsNullOrEmpty(targetEntityLogicalName) || targetId == Guid.Empty)
+                {
+                    UpdateTemplateResult(service, template, "模板信息不完整：缺少目标实体或目标 ID。");
+                    return;
+                }
+
+                // 1. 获取主实体 metadata 与记录
+                var mainMeta = RetrieveEntityMetadata(service, targetEntityLogicalName);
+                if (mainMeta == null)
+                {
+                    UpdateTemplateResult(service, template, $"无法获取实体元数据：{targetEntityLogicalName}");
+                    return;
+                }
+                var mainRecord = service.Retrieve(targetEntityLogicalName, targetId, new ColumnSet(true));
+
+                // 2. 递归导出
+                var sb = new StringBuilder();
+                var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // 防止循环
+                var exportedSections = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                ExportEntityRecursive(service, mainMeta, mainRecord, sb, visited, exportedSections, depth, includeLookups, tracing);
+
+                // 3. 写入 Annotation（或上传到外部）
+                var csvBytes = Encoding.UTF8.GetBytes(sb.ToString());
+                if (csvBytes.Length > AnnotationMaxBytes)
+                {
+                    // 若文件太大，建议上传到 Blob/SharePoint 并将链接写到 template.new_result_note
+                    UpdateTemplateResult(service, template, $"导出成功但文件过大（{csvBytes.Length} bytes），超出注释限制，请使用外部存储。");
+                    return;
+                }
+
+                var note = new Entity("annotation");
+                note["subject"] = $"Export CSV: {targetEntityLogicalName} - {targetId}";
+                note["filename"] = $"{targetEntityLogicalName}_{targetId}.csv";
+                note["mimetype"] = "text/csv";
+                note["documentbody"] = Convert.ToBase64String(csvBytes);
+                note["filesize"] = csvBytes.Length;
+                note["notetext"] = "由 RecursiveCsvExportPlugin 自动生成";
+                note["objectid"] = new EntityReference(targetEntityLogicalName, targetId);
+                service.Create(note);
+
+                UpdateTemplateResult(service, template, $"导出成功，附件大小：{csvBytes.Length} bytes。");
+            }
+            catch (Exception ex)
+            {
+                tracing.Trace("RecursiveCsvExportPlugin error: " + ex.ToString());
+                try
+                {
+                    if (context.InputParameters.Contains("Target") && context.InputParameters["Target"] is Entity template)
+                        UpdateTemplateResult(service, template, "导出失败：" + ex.Message);
+                }
+                catch { }
+                throw;
+            }
+        }
+
+        #region 递归导出核心
+
+        private void ExportEntityRecursive(IOrganizationService service,
+                                           EntityMetadata meta,
+                                           Entity instance,
+                                           StringBuilder sb,
+                                           HashSet<string> visited,
+                                           HashSet<string> exportedSections,
+                                           int depthLeft,
+                                           bool includeLookups,
+                                           ITracingService tracing)
+        {
+            if (meta == null || instance == null) return;
+
+            string key = $"{meta.LogicalName}:{instance.Id}";
+            if (visited.Contains(key))
+            {
+                tracing.Trace($"跳过已访问记录 {key}");
+                return;
+            }
+            visited.Add(key);
+
+            // 把当前实体作为一个 section 导出（header + 一行数据）
+            string sectionId = $"Entity:{meta.LogicalName}:{instance.Id}";
+            if (!exportedSections.Contains(sectionId))
+            {
+                exportedSections.Add(sectionId);
+                AppendEntitySection(service, meta, instance, sb, tracing);
+            }
+
+            // 导出 1:N 子表（Sub Table）
+            if (meta.OneToManyRelationships != null)
+            {
+                foreach (var rel in meta.OneToManyRelationships)
+                {
+                    try
+                    {
+                        var childLogicalName = rel.ReferencingEntity;
+                        var childRefAttr = rel.ReferencingAttribute;
+                        if (string.IsNullOrEmpty(childLogicalName)) continue;
+
+                        var qe = new QueryExpression(childLogicalName) { ColumnSet = new ColumnSet(true) };
+                        if (!string.IsNullOrEmpty(childRefAttr))
+                        {
+                            qe.Criteria.AddCondition(childRefAttr, ConditionOperator.Equal, instance.Id);
+                        }
+                        else
+                        {
+                            // fallback: 在 child metadata 找到指向当前 entity 的 lookup
+                            var childMeta = RetrieveEntityMetadata(service, childLogicalName);
+                            string found = null;
+                            if (childMeta != null)
+                            {
+                                foreach (var a in childMeta.Attributes.OfType<LookupAttributeMetadata>())
+                                {
+                                    if (a.Targets != null && a.Targets.Contains(meta.LogicalName))
+                                    {
+                                        found = a.SchemaName;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!string.IsNullOrEmpty(found))
+                                qe.Criteria.AddCondition(found, ConditionOperator.Equal, instance.Id);
+                            else
+                                continue;
+                        }
+
+                        var children = RetrieveAll(service, qe);
+
+                        sb.AppendLine($"\"Sub Table: {childLogicalName} (relationship: {rel.SchemaName})\"");
+                        if (children.Entities.Count == 0)
+                        {
+                            sb.AppendLine("\"No records\"");
+                            sb.AppendLine();
+                        }
+                        else
+                        {
+                            var childMetaFull = RetrieveEntityMetadata(service, childLogicalName);
+                            var childAttrs = childMetaFull.Attributes.Where(a => a.AttributeType != AttributeTypeCode.Virtual).ToList();
+                            var childCols = childAttrs.Select(a => a.LogicalName).ToList();
+                            sb.AppendLine(string.Join(",", childCols.Select(c => CsvEscape(c))));
+
+                            foreach (var ch in children.Entities)
+                            {
+                                var row = new List<string>();
+                                foreach (var col in childCols)
+                                {
+                                    if (ch.Attributes.Contains(col))
+                                    {
+                                        var attrMeta = childAttrs.FirstOrDefault(a => a.LogicalName == col);
+                                        var raw = ch[col];
+                                        var s = ConvertAttributeValueToString(service, raw, attrMeta, 1);
+                                        row.Add(CsvEscape(s));
+                                    }
+                                    else row.Add(CsvEscape(""));
+                                }
+                                sb.AppendLine(string.Join(",", row));
+                            }
+                            sb.AppendLine();
+                        }
+
+                        // 对子表中每条记录的 lookup 字段递归导出（如果 depthLeft>0 且 includeLookups=true）
+                        if (depthLeft > 0 && includeLookups)
+                        {
+                            foreach (var ch in children.Entities)
+                            {
+                                foreach (var attr in ch.Attributes)
+                                {
+                                    if (attr.Value is EntityReference er)
+                                    {
+                                        var refMeta = RetrieveEntityMetadata(service, er.LogicalName);
+                                        if (refMeta == null) continue;
+                                        var refEntity = service.Retrieve(er.LogicalName, er.Id, new ColumnSet(true));
+                                        ExportEntityRecursive(service, refMeta, refEntity, sb, visited, exportedSections, depthLeft - 1, includeLookups, tracing);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        tracing.Trace($"导出子表 {rel.SchemaName} 出错: {ex.Message}");
+                    }
+                }
+            }
+
+            // 导出当前实体的 lookup 指向（Related Table）
+            if (depthLeft > 0 && includeLookups)
+            {
+                foreach (var attr in instance.Attributes)
+                {
+                    if (attr.Value is EntityReference er)
+                    {
+                        try
+                        {
+                            string refSection = $"Entity:{er.LogicalName}:{er.Id}";
+                            if (exportedSections.Contains(refSection)) continue;
+
+                            var refMeta = RetrieveEntityMetadata(service, er.LogicalName);
+                            if (refMeta == null) continue;
+                            var refEntity = service.Retrieve(er.LogicalName, er.Id, new ColumnSet(true));
+                            ExportEntityRecursive(service, refMeta, refEntity, sb, visited, exportedSections, depthLeft - 1, includeLookups, tracing);
+                        }
+                        catch (Exception ex)
+                        {
+                            tracing.Trace($"导出引用实体 {er.LogicalName}:{er.Id} 失败: {ex.Message}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // 将实体写入为一个 section（标题 + header + 一行数据）
+        private void AppendEntitySection(IOrganizationService service, EntityMetadata meta, Entity entity, StringBuilder sb, ITracingService tracing)
+        {
+            sb.AppendLine($"\"Entity: {meta.LogicalName} (id: {entity.Id})\"");
+            var attrs = meta.Attributes.Where(a => a.AttributeType != AttributeTypeCode.Virtual).ToList();
+            var headers = attrs.Select(a => a.LogicalName).ToArray();
+            sb.AppendLine(string.Join(",", headers.Select(h => CsvEscape(h))));
+            var vals = new List<string>();
+            foreach (var a in attrs)
+            {
+                string s = "";
+                if (entity.Attributes.Contains(a.LogicalName))
+                {
+                    var raw = entity[a.LogicalName];
+                    s = ConvertAttributeValueToString(service, raw, a, 1);
+                }
+                vals.Add(CsvEscape(s));
+            }
+            sb.AppendLine(string.Join(",", vals));
+            sb.AppendLine();
+        }
+
+        #endregion
+
+        #region 辅助：metadata, retrieve, convert, csv escape
+
+        private EntityMetadata RetrieveEntityMetadata(IOrganizationService service, string logicalName)
+        {
+            try
+            {
+                var req = new RetrieveEntityRequest
+                {
+                    LogicalName = logicalName,
+                    EntityFilters = EntityFilters.Attributes | EntityFilters.Relationships,
+                    RetrieveAsIfPublished = true
+                };
+                var resp = (RetrieveEntityResponse)service.Execute(req);
+                return resp.EntityMetadata;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private EntityCollection RetrieveAll(IOrganizationService service, QueryExpression qe)
+        {
+            var result = new EntityCollection();
+            int page = 1;
+            int fetch = 5000;
+            qe.PageInfo = new PagingInfo { Count = fetch, PageNumber = page, PagingCookie = null };
+            while (true)
+            {
+                var pageResult = service.RetrieveMultiple(qe);
+                if (pageResult.Entities != null && pageResult.Entities.Count > 0)
+                    result.Entities.AddRange(pageResult.Entities);
+                if (pageResult.MoreRecords)
+                {
+                    page++;
+                    qe.PageInfo.PageNumber = page;
+                    qe.PageInfo.PagingCookie = pageResult.PagingCookie;
+                }
+                else break;
+            }
+            return result;
+        }
+
+        private string ConvertAttributeValueToString(IOrganizationService service, object raw, AttributeMetadata meta, int depthLeft)
+        {
+            if (raw == null) return "";
+            try
+            {
+                if (raw is EntityReference er)
+                {
+                    return $"{er.Name ?? ""} ({er.Id})";
+                }
+                if (raw is OptionSetValue osv)
+                {
+                    if (meta is EnumAttributeMetadata enumMeta && enumMeta.OptionSet?.Options != null)
+                    {
+                        var opt = enumMeta.OptionSet.Options.FirstOrDefault(o => o.Value == osv.Value);
+                        if (opt?.Label?.UserLocalizedLabel != null) return opt.Label.UserLocalizedLabel.Label;
+                    }
+                    return osv.Value.ToString();
+                }
+                if (raw is OptionSetValueCollection osvc)
+                {
+                    return string.Join(";", osvc.Select(x => x.Value.ToString()));
+                }
+                if (raw is Money m) return m.Value.ToString("F2");
+                if (raw is DateTime dt) return dt.ToString("o");
+                if (raw is bool b) return b ? "true" : "false";
+                if (raw is AliasedValue av) return ConvertAttributeValueToString(service, av.Value, meta, depthLeft);
+                if (raw is string s) return s;
+                if (raw is int || raw is long || raw is decimal || raw is double) return raw.ToString();
+                return raw.ToString();
+            }
+            catch
+            {
+                return raw.ToString();
+            }
+        }
+
+        private string CsvEscape(string input)
+        {
+            if (input == null) return "\"\"";
+            var s = input.Replace("\"", "\"\"");
+            return $"\"{s}\"";
+        }
+
+        #endregion
+
+        #region Template result helpers & small utilities
+
+        private void UpdateTemplateResult(IOrganizationService service, Entity template, string message)
+        {
+            try
+            {
+                var upd = new Entity(template.LogicalName, template.Id);
+                if (!string.IsNullOrEmpty(Template_ResultField))
+                    upd[Template_ResultField] = message;
+                service.Update(upd);
+            }
+            catch { }
+        }
+
+        private string GetString(Entity e, string fld) => e.Contains(fld) ? e.GetAttributeValue<string>(fld) : null;
+        private Guid GetGuid(Entity e, string fld) => e.Contains(fld) ? e.GetAttributeValue<Guid>(fld) : Guid.Empty;
+        private int GetInt(Entity e, string fld, int defaultVal)
+        {
+            if (!e.Contains(fld)) return defaultVal;
+            var o = e[fld];
+            if (o is int i) return i;
+            if (o is OptionSetValue osv) return osv.Value;
+            if (o is long l) return (int)l;
+            return defaultVal;
+        }
+        private bool GetBool(Entity e, string fld, bool defaultVal)
+        {
+            if (!e.Contains(fld)) return defaultVal;
+            var o = e[fld];
+            if (o is bool b) return b;
+            if (o is OptionSetValue osv) return osv.Value != 0;
+            return defaultVal;
+        }
+
+        #endregion
+    }
+}
+五、如何打包 & 注册（步骤）
+
+在 Visual Studio 新建 Class Library（.NET Framework 与你 Dataverse SDK 相兼容，例如 .NET Framework 4.7.2）。
+
+用 NuGet 安装 Microsoft.CrmSdk.CoreAssemblies。
+
+把上面 RecursiveCsvExportPlugin.cs 加入项目，编译生成 DLL。
+
+使用 Plugin Registration Tool 上传程序集（Isolation Mode: Sandbox 推荐）。
+
+注册 Step（建议）：
+
+Message: Create（也可注册 Update，Filtering Attributes 填 new_status）
+
+Primary Entity: new_exporttemplate（template 表）
+
+Stage: PostOperation
+
+Execution Mode: Asynchronous（推荐）
+
+User: System 或有足够权限的用户
+
+创建 new_exporttemplate 表与字段（见上文）并确保插件常量匹配字段名。
+
+在目标实体（例如 new_case）表单上添加 Ribbon 按钮，调用 createExportRequest.js。
+
+测试流程：在 Case 表单点击导出 → 在 new_exporttemplate 看到记录 → 异步插件执行 → 在主记录 Notes/附件看到 CSV。
+
+
+
+🧩 一、主表在导出中的地位
+
+主表（Main Table）是整个导出过程的起点。
+你在 PowerApps 模型驱动应用中点击「Export CSV」按钮时，传入的 GUID（通常是主表记录的主键，比如 CaseId）就是导出的根节点。
+
+例如：
+
+你点的是 Case 记录（new_case）
+
+插件在后台根据这个 CaseId 去查主表的所有字段
+
+然后递归处理：它的子表、Lookup 字段、Lookup 的 Lookup…
+
+所以 主表永远是 CSV 的第一个 section。
+
+🧾 二、CSV 文件总体结构（主表 + 子表 + Lookup）
+
+以 “Case” 为例，最终导出的 CSV 结构如下 👇：
+
+=== Main Table: new_case ===
+CaseId,Title,Status,Customer,Customer_Name
+c001,"网络故障","处理中","accountid_123","Contoso Ltd."
+
+=== Sub Table: new_casesubtask (子表 of new_case) ===
+SubTaskId,Name,DueDate,Owner,Owner_Name
+sub001,"现场检查","2025-10-20","userid_1","张三"
+sub002,"报告编写","2025-10-21","userid_2","李四"
+
+=== Sub Table: new_casehistory (子表 of new_case) ===
+HistoryId,Action,CreatedOn,CreatedBy,CreatedBy_Name
+his001,"创建","2025-10-19","userid_1","张三"
+his002,"状态更新","2025-10-20","userid_2","李四"
+
+=== Related Table: account (from Lookup: Customer) ===
+AccountId,Name,ParentAccount,ParentAccount_Name
+accountid_123,"Contoso Ltd.","accountid_999","Global Holding Inc."
+
+=== Related Table: account (from Lookup: ParentAccount) ===
+AccountId,Name,ParentAccount
+accountid_999,"Global Holding Inc.",
+
+🔍 三、主表的 CSV section 内容
+
+主表在 CSV 的第一块 section 中展示：
+
+标题行：=== Main Table: {表名} ===
+
+字段行：主表所有字段（包括 lookup、text、number、datetime、boolean）
+
+数据行：实际数据
+
+⚙️ 注意：lookup 字段会显示两个值
+一个是 lookup 的 id（例如 Customer = accountid_123），
+另一个是 lookup 的 name（例如 Customer_Name = Contoso Ltd.）
+
+🧠 四、主表和子表/lookup 的递归关系图
+Main Table: new_case
+│
+├── Sub Table: new_casesubtask
+│     └── Lookup: Owner (SystemUser)
+│
+├── Sub Table: new_casehistory
+│     └── Lookup: CreatedBy (SystemUser)
+│
+└── Lookup: Customer (Account)
+      └── Lookup: ParentAccount (Account)
